@@ -92,6 +92,7 @@ class PickSet:
     # ------------------------------------------------------------------- I/O
     def to_csv(self, path: str | Path) -> Path:
         path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=PICK_FIELDS)
             w.writeheader()

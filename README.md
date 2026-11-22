@@ -7,7 +7,7 @@ validated core: SEG-Y ingestion with a QC gate, chunked HDF5 storage, structure-
 Wu & Fomel (2018) style least-squares horizon extractor with multigrid DTW correlations and fault
 barriers, plus QC, confidence drivers, export and provenance.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the architecture, algorithm, assumptions, staged plan,
+**New users: start with [docs/USER_GUIDE.md](docs/USER_GUIDE.md).** See [docs/DESIGN.md](docs/DESIGN.md) for the architecture, algorithm, assumptions, staged plan,
 validation plan and risk register.
 
 ## Install
@@ -27,6 +27,9 @@ shai qc path\to\survey.sgy --report qc.md
 
 # QC + convert to chunked HDF5, optionally an ROI (line numbers, ms)
 shai convert path\to\survey.sgy data\seismic_hdf5\survey.h5 --inlines 10000 10200 --time-ms 1500 3000
+
+# seed picks -> horizon (+ fault sticks as barriers), with figures
+shai extract survey.h5 picks.csv outputsun --fault-sticks faultA.txt --show
 
 # end-to-end synthetic benchmark with report and figures
 shai demo outputs\demo
