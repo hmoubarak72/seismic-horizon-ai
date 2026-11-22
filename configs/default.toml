@@ -1,0 +1,35 @@
+# seismic_horizon_ai default configuration (version-controlled).
+# Every key maps to a dataclass field in src/seismic_horizon_ai/config.py; unknown keys are rejected.
+random_seed = 12345
+
+[segy]
+iline_byte = 189          # SEG-Y rev1 standard; Volve and many surveys use 189/193
+xline_byte = 193
+cdp_x_byte = 181
+cdp_y_byte = 185
+endian = "big"
+hdf5_chunks = [64, 64, 64]
+
+[structure_tensor]
+sigma_gradient = 1.0       # samples
+sigma_smooth = [3.0, 3.0, 2.0]   # (inline, crossline, time) samples
+chunk_inlines = 64
+
+[horizon]
+max_iterations = 8
+tolerance = 0.02           # samples
+slope_weight_power = 2.0
+min_slope_weight = 0.02
+fault_soft_power = 2.0
+fault_hard_threshold = 0.9 # fault probability at/above which an edge becomes a barrier
+seed_mode = "hard"         # interpreter picks honoured exactly
+solver = "auto"
+
+[horizon.correlation]
+enabled = true
+strides = [4, 8, 16]
+half_window = 20
+max_lag = 6
+min_correlation = 0.6
+weight = 1.0
+refresh_iterations = 2

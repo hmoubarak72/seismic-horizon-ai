@@ -1,0 +1,14 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+outputs/
+data/input_segy/*
+data/seismic_hdf5/*
+data/attributes/*
+data/horizons/*
+!data/**/.gitkeep
+*.sgy
+*.segy
+*.h5
+*.hdf5
+*.zarr/
