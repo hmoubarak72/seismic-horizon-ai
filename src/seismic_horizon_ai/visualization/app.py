@@ -21,7 +21,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
         self.conf_full: np.ndarray | None = None
         self._thread: QThread | None = None
         self._section_cache: dict = {}
+        self._keep_view = False  # True once the user zoomed: keep the view across redraws and picks
 
         self._build_ui()
         self._build_menus()
@@ -240,7 +241,13 @@ class MainWindow(QMainWindow):
         sv.addLayout(top)
         self.sec_canvas = PlotCanvas()
         self.sec_canvas.mpl_connect("button_press_event", self._section_click)
-        sv.addWidget(NavigationToolbar2QT(self.sec_canvas, sec))
+        self.sec_canvas.mpl_connect("button_release_event", self._section_release)
+        self.sec_canvas.mpl_connect("scroll_event", self._section_scroll)
+        self.sec_toolbar = NavigationToolbar2QT(self.sec_canvas, sec)
+        tb_row = QHBoxLayout(); tb_row.addWidget(self.sec_toolbar)
+        b = QPushButton("Reset zoom"); b.clicked.connect(self.reset_section_zoom); tb_row.addWidget(b)
+        tb_row.addWidget(QLabel("Mouse wheel = zoom · zoom box exits automatically so you can keep picking")); tb_row.addStretch(1)
+        sv.addLayout(tb_row)
         sv.addWidget(self.sec_canvas, 1)
         self.tabs.addTab(sec, "Seismic section")
 
@@ -536,6 +543,7 @@ class MainWindow(QMainWindow):
         if self.vol is None or ev.inaxes is not self.sec_canvas.ax or ev.xdata is None:
             return
         if self.sec_canvas.toolbar_mode():
+            self.statusBar().showMessage("Pan tool is on: click the hand icon again (or press Reset zoom) to go back to picking.")
             return
         g = self.g
         inline_view = self.direction.currentIndex() == 0
@@ -574,6 +582,43 @@ class MainWindow(QMainWindow):
         off = 0.5 * (a - c) / den if den < 0 else 0.0
         return float(g.time_ms(k + np.clip(off, -0.5, 0.5)))
 
+    def _section_release(self, ev):
+        """After a zoom-box drag, switch the zoom tool off so the next click picks again."""
+        tb = self.sec_toolbar
+        mode = str(getattr(tb, "mode", ""))
+        if "zoom" in mode:
+            self._keep_view = True
+            QTimer.singleShot(0, self._exit_zoom_tool)
+        elif "pan" in mode:
+            self._keep_view = True
+
+    def _exit_zoom_tool(self):
+        if "zoom" in str(getattr(self.sec_toolbar, "mode", "")):
+            self.sec_toolbar.zoom()  # toggles the zoom tool off
+        self.statusBar().showMessage("Zoomed in. Left-click to pick; Reset zoom to see the whole line.")
+
+    def _section_scroll(self, ev):
+        """Mouse-wheel zoom centred on the cursor (picking stays active)."""
+        if ev.inaxes is not self.sec_canvas.ax or ev.xdata is None:
+            return
+        ax = self.sec_canvas.ax
+        f = 1 / 1.25 if ev.button == "up" else 1.25
+        x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+        ax.set_xlim(ev.xdata + (x0 - ev.xdata) * f, ev.xdata + (x1 - ev.xdata) * f)
+        ax.set_ylim(ev.ydata + (y0 - ev.ydata) * f, ev.ydata + (y1 - ev.ydata) * f)
+        self._keep_view = True
+        self.sec_canvas.draw_idle()
+
+    def reset_section_zoom(self):
+        tb = self.sec_toolbar
+        mode = str(getattr(tb, "mode", ""))
+        if "zoom" in mode:
+            tb.zoom()
+        elif "pan" in mode:
+            tb.pan()
+        self._keep_view = False
+        self.draw_section()
+
     def undo(self):
         if not self.undo_stack:
             return
@@ -603,6 +648,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ navigation
     def _direction_changed(self):
+        self._keep_view = False
         if self.vol is None:
             return
         g = self.g
@@ -746,6 +792,7 @@ class MainWindow(QMainWindow):
 
     def draw_section(self):
         c = self.sec_canvas; ax = c.ax
+        saved = (ax.get_xlim(), ax.get_ylim()) if self._keep_view and ax.images else None
         ax.clear()
         if self.vol is None:
             ax.text(0.5, 0.5, "File > Open SEG-Y... to start", ha="center", va="center", transform=ax.transAxes, fontsize=14, color="gray")
@@ -787,6 +834,8 @@ class MainWindow(QMainWindow):
                 lo, hi = np.nanmin(h), np.nanmax(h)
                 pad = max(150.0, (hi - lo) * 0.6)
                 ax.set_ylim(min(g.samples_ms[-1], hi + pad), max(g.samples_ms[0], lo - pad))
+        if saved is not None:  # keep the interpreter's zoom while picking or moving between lines
+            ax.set_xlim(*saved[0]); ax.set_ylim(*saved[1])
         c.draw_idle()
 
     def draw_timeslice(self):
