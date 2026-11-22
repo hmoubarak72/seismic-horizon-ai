@@ -23,7 +23,24 @@ windowed GUI yet) and writes results as CSV files, figures and QC reports.
 3. Tracked horizon FS8 across Fault A and compared it with dGB's own interpretation:
    1.25 ms mean difference, 99% of traces within ±10 ms (conventional peak tracking: 7.4 ms).
 
-## How to use it (Windows)
+## The desktop app (recommended)
+
+Double-click **Seismic Horizon Interpreter** on your desktop (or run `shai-gui`). It reopens the last volume.
+
+1. **File > Open SEG-Y...** checks the file (QC report tab) and saves a fast copy (HDF5); **Open HDF5 volume...** opens one directly.
+2. **Seismic section** tab: choose Inline/Crossline, move the slider. **Left-click** the target reflection to add a pick
+   (it snaps to the nearest peak or trough, see "Snap to"). **Right-click** removes a pick, **Ctrl+Z** undoes.
+   Pick on several lines and on both sides of every fault. **Time slice** tab: click to jump to a line.
+3. Optional: **Load fault sticks...** (faults become barriers) and **Load reference horizon...** (to compare).
+   File > Import picks from horizon file... samples an existing horizon every Nth line.
+4. Press **Extract horizon**. The area is chosen around your picks unless you untick "Automatic".
+5. Review: horizon on the sections, **Horizon map** (time, confidence, difference to reference), **3D view**.
+   Add picks where it is wrong and extract again.
+6. **File > Export horizon (CSV)**, **Save picks**, **Save figures**.
+
+## Command line (for scripting)
+
+### Setup
 
 Open PowerShell in the app folder:
 
