@@ -29,8 +29,7 @@ shai qc path\to\survey.sgy --report qc.md
 shai convert path\to\survey.sgy data\seismic_hdf5\survey.h5 --inlines 10000 10200 --time-ms 1500 3000
 
 # seed picks -> horizon (+ fault sticks as barriers), with figures
-shai extract survey.h5 picks.csv outputs
-un --fault-sticks faultA.txt --show
+shai extract survey.h5 picks.csv outputs\run --fault-sticks faultA.txt --show
 
 # end-to-end synthetic benchmark with report and figures
 shai demo outputs\demo
