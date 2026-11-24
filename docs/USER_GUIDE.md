@@ -25,7 +25,16 @@ windowed GUI yet) and writes results as CSV files, figures and QC reports.
 
 ## The desktop app (recommended)
 
-Double-click **Seismic Horizon Interpreter** on your desktop (or run `shai-gui`). It reopens the last volume.
+Double-click **Seismic Horizon Interpreter** on your desktop (or run `shai-gui`). It reopens the last project
+(or, if you have none yet, the last volume).
+
+**Projects.** **File > New project...** asks for a name, a folder and the seismic (SEG-Y or HDF5). A SEG-Y is
+checked and converted once to a fast HDF5 copy in `C:\SeismicData\<name>\`; the project only points to it.
+**File > Save project** (Ctrl+S) writes `<name>.shproj` (picks with full provenance, faults, reference horizon,
+area and display settings) plus `<name>.shproj.npz` (the last extracted horizon, confidence, fault cut-offs).
+Keep the two files together. **File > Open project...** restores everything, including the last horizon, without
+re-running the engine. The title bar shows `*` while there are unsaved changes, and the app asks before closing.
+If the seismic volume has moved, the app asks you to locate it.
 
 1. **File > Open SEG-Y...** checks the file (QC report tab) and saves a fast copy (HDF5); **Open HDF5 volume...** opens one directly.
 2. **Seismic section** tab: choose Inline/Crossline, move the slider. **Left-click** the target reflection to add a pick
@@ -36,7 +45,7 @@ Double-click **Seismic Horizon Interpreter** on your desktop (or run `shai-gui`)
 4. Press **Extract horizon**. The area is chosen around your picks unless you untick "Automatic".
 5. Review: horizon on the sections, **Horizon map** (time, confidence, difference to reference), **3D view**.
    Add picks where it is wrong and extract again.
-6. **File > Export horizon (CSV)**, **Save picks**, **Save figures**.
+6. **File > Save project**, **Export horizon (CSV)**, **Save picks (CSV)**, **Save figures**.
 
 ## Command line (for scripting)
 

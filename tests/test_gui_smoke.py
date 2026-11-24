@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["SHAI_NO_RESTORE"] = "1"  # never reopen the user's real last project in tests
 
 
 def test_app_end_to_end(tmp_path):
@@ -43,6 +44,7 @@ def test_app_end_to_end(tmp_path):
         w.map_kind.setCurrentIndex(k)
     w.draw_timeslice()
     w.export_horizon  # menu action exists
+    w.dirty = False  # skip the save-changes prompt
     w.close()
 
 
@@ -92,4 +94,5 @@ def test_picking_works_after_zoom(tmp_path):
     assert w.sec_canvas.ax.get_xlim()[1] - w.sec_canvas.ax.get_xlim()[0] < 5
     w.reset_section_zoom()
     assert w.sec_canvas.ax.get_xlim()[1] - w.sec_canvas.ax.get_xlim()[0] > 10
+    w.dirty = False  # skip the save-changes prompt
     w.close()

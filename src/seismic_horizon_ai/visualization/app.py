@@ -1,6 +1,7 @@
 """Seismic Horizon Interpreter: desktop application (PySide6 + matplotlib + PyVista).
 
 Workflow in the window:
+  0. File > New project (name, folder, seismic) / Open project / Save project (.shproj + .npz sidecar).
   1. File > Open SEG-Y (QC + conversion) or Open HDF5 volume.
   2. Browse inlines / crosslines / time slices; click on a reflection to add a seed pick
      (right-click removes the nearest pick, Ctrl+Z undoes). Optionally snap to peak/trough.
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -61,11 +63,12 @@ from matplotlib.figure import Figure  # noqa: E402
 from .. import __version__  # noqa: E402
 from ..horizon_engine.seed_picks import PickSet, SeedPick  # noqa: E402
 from ..preprocessing.roi_manager import ROI  # noqa: E402
+from ..project import PROJECT_SUFFIX, FaultEntry, HorizonState, Project, ProjectError, export_grid_csv  # noqa: E402
 from ..seismic_io.hdf5_manager import SeismicVolume  # noqa: E402
 from ..seismic_io.interpretation_io import read_fault_sticks, read_xyz_horizon  # noqa: E402
 
 APP_NAME = "Seismic Horizon Interpreter"
-DEFAULT_DATA_DIR = Path("C:/SeismicData") if os.name == "nt" else Path.home() / "SeismicData"
+DEFAULT_DATA_DIR = Path(os.environ.get("SHAI_DATA_DIR") or (Path("C:/SeismicData") if os.name == "nt" else Path.home() / "SeismicData"))
 
 
 def make_icon() -> QIcon:
@@ -135,13 +138,18 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("seismic_horizon_ai", "interpreter")
 
         self.vol: SeismicVolume | None = None
+        self.project = Project()
+        self.dirty = False  # unsaved changes in the project
         self.picks = PickSet()
         self.undo_stack: list[tuple[str, SeedPick]] = []
-        self.faults = []  # FaultSticks in full grid coords
+        self.faults: list[FaultEntry] = []  # fault sticks in full grid coords
         self.reference: np.ndarray | None = None  # sample index grid
-        self.output = None  # ExtractionOutput
+        self.reference_path, self.reference_shift = "", 0.0
+        self.output = None  # ExtractionOutput (only for a horizon extracted in this session)
         self.horizon_ms: np.ndarray | None = None
         self.conf_full: np.ndarray | None = None
+        self.cuts_full: list[np.ndarray] = []  # fault cut-offs in full-grid (il_idx, xl_idx)
+        self.horizon_summary: dict = {}
         self._thread: QThread | None = None
         self._section_cache: dict = {}
         self._keep_view = False  # True once the user zoomed: keep the view across redraws and picks
@@ -149,9 +157,15 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menus()
         self._refresh_all()
+        self._update_title()
+        if os.environ.get("SHAI_NO_RESTORE"):
+            return
+        last_proj = self.settings.value("last_project", "")
         last = self.settings.value("last_h5", "")
-        if last and Path(last).exists():
-            self.open_h5(last)  # reopen the last survey so work continues where it stopped
+        if last_proj and Path(last_proj).exists():
+            self.open_project(last_proj)  # reopen the last project so work continues where it stopped
+        elif last and Path(last).exists():
+            self.open_h5(last)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -255,6 +269,8 @@ class MainWindow(QMainWindow):
         ts = QWidget(); tv = QVBoxLayout(ts); self.ts_tab = ts
         top = QHBoxLayout()
         self.t_slider = QSlider(Qt.Horizontal); self.t_slider.sliderReleased.connect(self.draw_timeslice)
+        # keyboard / click steps change the value without a release: redraw then (dragging redraws on release)
+        self.t_slider.valueChanged.connect(lambda _v: None if self.t_slider.isSliderDown() or self.tabs.currentWidget() is not self.ts_tab else self.draw_timeslice())
         self.t_label = QLabel("")
         top.addWidget(QLabel("Time slice:")); top.addWidget(self.t_slider, 1); top.addWidget(self.t_label)
         tv.addLayout(top)
@@ -289,12 +305,18 @@ class MainWindow(QMainWindow):
     def _build_menus(self):
         m = self.menuBar().addMenu("&File")
         for text, fn, key in [
+            ("New project...", self.new_project_dialog, "Ctrl+N"),
+            ("Open project...", self.open_project, "Ctrl+Shift+P"),
+            ("Open recent project", self.open_recent_project, None),
+            ("Save project", self.save_project, "Ctrl+S"),
+            ("Save project as...", self.save_project_as, "Ctrl+Shift+S"),
+            (None, None, None),
             ("Open SEG-Y...", self.open_segy, "Ctrl+O"),
             ("Open HDF5 volume...", self.open_h5, "Ctrl+Shift+O"),
             ("Open recent volume", self.open_recent, None),
             (None, None, None),
             ("Load picks (CSV)...", self.load_picks, "Ctrl+L"),
-            ("Save picks (CSV)...", self.save_picks, "Ctrl+S"),
+            ("Save picks (CSV)...", self.save_picks, None),
             ("Import picks from horizon file...", self.import_picks_from_horizon, None),
             (None, None, None),
             ("Export horizon (CSV)...", self.export_horizon, "Ctrl+E"),
@@ -325,10 +347,11 @@ class MainWindow(QMainWindow):
         if msg:
             self.statusBar().showMessage(msg)
 
-    def _start(self, fn, args, on_done, label):
+    def _start(self, fn, args, on_done, label, on_fail=None):
         if self._thread is not None:
             QMessageBox.information(self, APP_NAME, "Please wait: a task is still running.")
             return
+        self._fail_cb = on_fail
         self._busy(True, label)
         th = QThread(self)
         w = Worker(fn, *args)
@@ -352,7 +375,9 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, err: str):
         self._finish()
-        self._error(err)
+        cb, self._fail_cb = getattr(self, "_fail_cb", None), None
+        if cb is None or not cb(err):
+            self._error(err)
 
     def _finish(self):
         if self._thread:
@@ -366,7 +391,253 @@ class MainWindow(QMainWindow):
         box.setText(err.split("\n\n")[0]); box.setDetailedText(err); box.exec()
 
     # ------------------------------------------------------------------ files
+    # ---- project state
+    def _mark_dirty(self, on: bool = True):
+        self.dirty = on
+        self._update_title()
+
+    def _update_title(self):
+        name = self.project.name if self.project.path else f"{self.project.name} (not saved yet)"
+        self.setWindowTitle(f"{'*' if self.dirty else ''}{name} — {APP_NAME} {__version__}")
+
+    def _maybe_save(self) -> bool:
+        """Ask to save unsaved work. Returns False if the user cancelled."""
+        if not self.dirty:
+            return True
+        r = QMessageBox.question(self, APP_NAME, f"Save changes to project '{self.project.name}'?",
+                                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
+        if r == QMessageBox.Cancel:
+            return False
+        if r == QMessageBox.Save:
+            return self.save_project()
+        return True
+
+    def _reset_interpretation(self):
+        self.picks = PickSet(); self.undo_stack = []
+        self.faults = []; self.reference = None; self.reference_path, self.reference_shift = "", 0.0
+        self.output = None; self.horizon_ms = None; self.conf_full = None; self.cuts_full = []; self.horizon_summary = {}
+        self.result_box.clear()
+
+    def new_project_dialog(self):
+        if not self._maybe_save():
+            return
+        dlg = QDialog(self); dlg.setWindowTitle("New project"); dlg.setMinimumWidth(640)
+        f = QFormLayout(dlg)
+        name = QLineEdit("New interpretation")
+        folder = QLineEdit(self.settings.value("last_project_dir", "") or str(Path.home() / "Documents"))
+        seis = QLineEdit(str(self.vol.path) if self.vol else "")
+
+        def browse_folder():
+            d = QFileDialog.getExistingDirectory(dlg, "Project folder", folder.text())
+            if d:
+                folder.setText(d)
+
+        def browse_seis():
+            p, _ = QFileDialog.getOpenFileName(dlg, "Seismic volume", self.settings.value("last_dir", ""),
+                                               "Seismic (*.sgy *.segy *.SGY *.SEGY *.h5 *.hdf5);;All files (*)")
+            if p:
+                seis.setText(p)
+
+        for label, edit, fn in (("Project name", name, None), ("Save in folder", folder, browse_folder), ("Seismic (SEG-Y or HDF5)", seis, browse_seis)):
+            r = QHBoxLayout(); r.addWidget(edit, 1)
+            if fn:
+                b = QPushButton("Browse..."); b.clicked.connect(fn); r.addWidget(b)
+            f.addRow(label, r)
+        f.addRow(QLabel("A SEG-Y file is checked (QC) and converted once to a fast HDF5 copy in "
+                        f"{DEFAULT_DATA_DIR}; the project only points to it."))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); f.addRow(bb)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        while True:
+            if dlg.exec() != QDialog.Accepted:
+                return
+            problems = []
+            if not name.text().strip():
+                problems.append("Give the project a name.")
+            if not folder.text().strip():
+                problems.append("Choose a folder.")
+            if not seis.text().strip() or not Path(seis.text().strip()).exists():
+                problems.append("Choose an existing seismic file.")
+            if not problems:
+                break
+            QMessageBox.warning(self, APP_NAME, "\n".join(problems))
+        target = Path(folder.text().strip()) / (_safe_name(name.text().strip()) + PROJECT_SUFFIX)
+        if target.exists() and QMessageBox.question(self, APP_NAME, f"{target.name} already exists in that folder. Replace it?") != QMessageBox.Yes:
+            return
+        self.new_project(name.text().strip(), target, seis.text().strip(), ask=True)
+
+    def new_project(self, name: str, project_file: str | Path, seismic: str | Path, ask: bool = False, force_qc: bool = False):
+        """Create and save a new project on a SEG-Y (converted first) or HDF5 volume."""
+        seismic = Path(seismic)
+        project_file = Path(project_file)
+
+        def create(h5: str, segy: str = ""):
+            self._reset_interpretation()
+            self.project = Project(name=name)
+            if not self._open_volume(h5):
+                return
+            self.project.volume_h5 = str(Path(h5).resolve())
+            self.project.source_segy = str(Path(segy).resolve()) if segy else ""
+            self._refresh_all()
+            self.save_project(project_file)
+            self.settings.setValue("last_project_dir", str(project_file.parent))
+            self.statusBar().showMessage(f"New project '{name}' created: {project_file}")
+
+        if seismic.suffix.lower() in (".h5", ".hdf5"):
+            create(str(seismic))
+            return
+        h5 = DEFAULT_DATA_DIR / seismic.stem / (seismic.stem + ".h5")
+        if h5.exists() and _h5_from_segy(h5, seismic):
+            if not ask or QMessageBox.question(
+                    self, APP_NAME, f"A checked copy of {seismic.name} already exists:\n{h5}\n\nUse it (faster)? "
+                                    "Choose No to check and convert the SEG-Y again.") == QMessageBox.Yes:
+                create(str(h5), str(seismic))
+                return
+        h5.parent.mkdir(parents=True, exist_ok=True)
+
+        def done(out):
+            out_path, report = out
+            create(str(out_path), str(seismic))
+            self.qc_text.setMarkdown(report.to_markdown())
+            self.tabs.setCurrentWidget(self.qc_text)
+
+        self._start(_convert, (str(seismic), str(h5), force_qc), done, f"Checking and converting {seismic.name}...",
+                    on_fail=lambda err: self._qc_failed(err, lambda: self.new_project(name, project_file, seismic, ask, True)))
+
+    def _qc_failed(self, err: str, retry) -> bool:
+        """SEG-Y QC refused the file: show why and let the interpreter decide to convert anyway."""
+        if "SeismicQCError" not in err:
+            return False
+        r = QMessageBox.warning(self, APP_NAME, err.split("\n\n")[0] + "\n\nConvert anyway? The QC findings are kept in the QC report.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r == QMessageBox.Yes:
+            QTimer.singleShot(0, retry)
+        return True
+
+    def _collect_settings(self) -> dict:
+        return {"snap": self.snap.currentText(), "auto_roi": self.auto_roi.isChecked(),
+                "roi": [self.il_min.value(), self.il_max.value(), self.xl_min.value(), self.xl_max.value()],
+                "margin_ms": self.margin.value(), "direction": self.direction.currentIndex(),
+                "line": self.line_spin.value(), "gain": self.gain.value(), "time_slice": self.t_slider.value(),
+                "map_kind": self.map_kind.currentText()}
+
+    def _apply_settings(self, s: dict):
+        if not s:
+            return
+        self.snap.setCurrentText(s.get("snap", self.snap.currentText()))
+        self.auto_roi.setChecked(bool(s.get("auto_roi", True)))
+        if len(s.get("roi", [])) == 4:
+            for w, v in zip((self.il_min, self.il_max, self.xl_min, self.xl_max), s["roi"]):
+                w.setValue(int(v))
+        self.margin.setValue(float(s.get("margin_ms", self.margin.value())))
+        self.gain.setValue(int(s.get("gain", self.gain.value())))
+        self.direction.setCurrentIndex(int(s.get("direction", 0)))  # resets the line slider
+        if "line" in s:
+            self.line_spin.setValue(int(s["line"]))
+        if "time_slice" in s:
+            self.t_slider.setValue(int(s["time_slice"]))
+        if s.get("map_kind"):
+            self.map_kind.setCurrentText(s["map_kind"])
+
+    def save_project(self, path: str | Path | None = None) -> bool:
+        if path is None and self.project.path is None:
+            return self.save_project_as()
+        if self.vol is None:
+            QMessageBox.information(self, APP_NAME, "Open a seismic volume (or create a new project) before saving."); return False
+        p = self.project
+        p.volume_h5 = str(self.vol.path.resolve())
+        p.picks = PickSet(list(self.picks.picks))
+        p.faults = list(self.faults)
+        p.reference, p.reference_path, p.reference_shift_ms = self.reference, self.reference_path, self.reference_shift
+        p.horizon = None if self.horizon_ms is None else HorizonState(self.horizon_ms, self.conf_full, list(self.cuts_full), self.horizon_summary)
+        p.settings = self._collect_settings()
+        try:
+            out = p.save(path)
+        except Exception as exc:
+            self._error(f"Could not save the project: {exc}\n\n{traceback.format_exc()}"); return False
+        self.settings.setValue("last_project", str(out))
+        self._mark_dirty(False)
+        self.statusBar().showMessage(f"Project saved: {out}")
+        return True
+
+    def save_project_as(self) -> bool:
+        if self.vol is None:
+            QMessageBox.information(self, APP_NAME, "Open a seismic volume (or create a new project) before saving."); return False
+        start = str(self.project.path or Path(self.settings.value("last_project_dir", "") or Path.home()) / (_safe_name(self.project.name) + PROJECT_SUFFIX))
+        path, _ = QFileDialog.getSaveFileName(self, "Save project as", start, f"Interpretation project (*{PROJECT_SUFFIX})")
+        if not path:
+            return False
+        if self.project.path is None or Path(path).stem != self.project.path.stem:
+            self.project.name = Path(path).stem if self.project.name in ("Untitled", "") else self.project.name
+        self.settings.setValue("last_project_dir", str(Path(path).parent))
+        return self.save_project(path)
+
+    def open_project(self, path: str | None = None) -> bool:
+        if not self._maybe_save():
+            return False
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Open project", self.settings.value("last_project_dir", ""),
+                                                  f"Interpretation project (*{PROJECT_SUFFIX});;All files (*)")
+            if not path:
+                return False
+        try:
+            proj = Project.load(path)
+        except ProjectError as exc:
+            self._error(str(exc)); return False
+        h5 = proj.volume_h5
+        if not h5 or not Path(h5).exists():
+            r = QMessageBox.question(self, APP_NAME, f"The project's seismic volume was not found:\n{h5 or '(none)'}\n\nLocate it now?")
+            if r != QMessageBox.Yes:
+                return False
+            h5, _ = QFileDialog.getOpenFileName(self, "Locate the seismic volume (HDF5)", str(DEFAULT_DATA_DIR), "HDF5 (*.h5 *.hdf5)")
+            if not h5:
+                return False
+        self._reset_interpretation()
+        self.project = proj
+        if not self._open_volume(h5):
+            return False
+        proj.volume_h5 = str(Path(h5).resolve())
+        g = self.g
+        shape = self.vol.live_mask.shape
+        self.picks = PickSet(list(proj.picks.picks))
+        self.faults = list(proj.faults)
+        self.reference_path, self.reference_shift = proj.reference_path, proj.reference_shift_ms
+        if proj.reference is not None and proj.reference.shape == shape:
+            self.reference = proj.reference
+        elif proj.reference_path and Path(proj.reference_path).exists():
+            self.reference = read_xyz_horizon(proj.reference_path, g, time_shift_ms=proj.reference_shift_ms)
+        warn = []
+        if proj.horizon is not None:
+            if proj.horizon.time_ms.shape == shape:
+                self.horizon_ms, self.conf_full = proj.horizon.time_ms, proj.horizon.confidence
+                self.cuts_full, self.horizon_summary = list(proj.horizon.cuts), dict(proj.horizon.summary)
+                self.result_box.setHtml(self._summary_html(self.horizon_summary, saved=True))
+            else:
+                warn.append("The saved horizon does not match this volume's grid and was not loaded.")
+        bad = [p for p in self.picks.picks if not (g.ilines[0] <= p.inline <= g.ilines[-1] and g.xlines[0] <= p.crossline <= g.xlines[-1])]
+        if bad:
+            warn.append(f"{len(bad)} picks lie outside this volume.")
+        self._apply_settings(proj.settings)
+        self.settings.setValue("last_project", str(proj.path))
+        self.settings.setValue("last_project_dir", str(proj.path.parent))
+        self._mark_dirty(False)
+        self._refresh_all()
+        self.statusBar().showMessage(f"Opened project {proj.path} ({len(self.picks.picks)} picks, {len(self.faults)} faults"
+                                     f"{', saved horizon' if self.horizon_ms is not None else ''})")
+        if warn:
+            QMessageBox.warning(self, APP_NAME, "\n".join(warn))
+        return True
+
+    def open_recent_project(self):
+        last = self.settings.value("last_project", "")
+        if last and Path(last).exists():
+            self.open_project(last)
+        else:
+            QMessageBox.information(self, APP_NAME, "No recent project.")
+
+    # ---- volumes
     def open_segy(self):
+        if not self._maybe_save():
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Open SEG-Y", self.settings.value("last_dir", ""), "SEG-Y (*.sgy *.segy *.SGY *.SEGY);;All files (*)")
         if not path:
             return
@@ -379,14 +650,16 @@ class MainWindow(QMainWindow):
 
         def done(out):
             out_path, report = out
+            self.open_h5(str(out_path), ask_save=False)
+            self.project.source_segy = str(Path(path).resolve())
             self.qc_text.setMarkdown(report.to_markdown())
-            self.open_h5(str(out_path))
             self.tabs.setCurrentWidget(self.qc_text)
 
-        def failed_qc(force=False):
-            self._start(_convert, (path, h5, force), done, "Converting SEG-Y...")
+        def convert(force=False):
+            self._start(_convert, (path, h5, force), done, "Converting SEG-Y...",
+                        on_fail=lambda err: self._qc_failed(err, lambda: convert(True)))
 
-        failed_qc(False)
+        convert(False)
 
     def open_recent(self):
         last = self.settings.value("last_h5", "")
@@ -395,21 +668,35 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, APP_NAME, "No recent volume.")
 
-    def open_h5(self, path: str | None = None):
+    def open_h5(self, path: str | None = None, ask_save: bool = True):
+        """Open a volume outside a project: starts a new, unsaved project on it."""
+        if ask_save and not self._maybe_save():
+            return
         if not path:
             path, _ = QFileDialog.getOpenFileName(self, "Open HDF5 volume", str(DEFAULT_DATA_DIR), "HDF5 (*.h5 *.hdf5)")
             if not path:
                 return
         try:
-            vol = SeismicVolume(path)
+            SeismicVolume(path).close()
         except Exception as exc:
             self._error(f"Could not open {path}: {exc}"); return
+        self._reset_interpretation()
+        self.project = Project(name=Path(path).stem)
+        if self._open_volume(path):
+            self.project.volume_h5 = str(Path(path).resolve())
+            self._mark_dirty(False)
+            self._refresh_all()
+
+    def _open_volume(self, path: str) -> bool:
+        try:
+            vol = SeismicVolume(path)
+        except Exception as exc:
+            self._error(f"Could not open {path}: {exc}"); return False
         if self.vol:
             self.vol.close()
         self.vol = vol
         self.settings.setValue("last_h5", path)
         self._section_cache.clear()
-        self.output = None; self.horizon_ms = None; self.conf_full = None; self.reference = None; self.faults = []
         g = self.g
         qc = vol.qc_report
         self.qc_text.setMarkdown(_qc_markdown(qc))
@@ -429,6 +716,7 @@ class MainWindow(QMainWindow):
         self._direction_changed()
         self.statusBar().showMessage(f"Opened {path}")
         self._refresh_all()
+        return True
 
     def load_picks(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load picks", self.settings.value("last_dir", ""), "CSV (*.csv)")
@@ -440,6 +728,7 @@ class MainWindow(QMainWindow):
             self._error(f"Could not read picks: {exc}"); return
         self.picks.extend(ps.picks)
         self.statusBar().showMessage(f"Loaded {len(ps.picks)} picks from {path}")
+        self._mark_dirty()
         self._refresh_all()
 
     def save_picks(self):
@@ -475,6 +764,8 @@ class MainWindow(QMainWindow):
                     self.picks.add(SeedPick(int(g.ilines[i]), int(g.xlines[j]), float(g.time_ms(h[i, j])), source=f"import:{Path(path).name}"))
                     n += 1
         self.statusBar().showMessage(f"Imported {n} picks from {Path(path).name}")
+        if n:
+            self._mark_dirty()
         self._refresh_all()
 
     def load_faults(self):
@@ -487,13 +778,21 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         for p in paths:
-            try:
-                self.faults.append(read_fault_sticks(p, self.g, time_shift_ms=shift))
-            except Exception as exc:
-                self._error(f"Could not read {p}: {exc}")
+            self.add_fault_file(p, shift)
         self._refresh_all()
 
+    def add_fault_file(self, path: str, shift_ms: float = 0.0) -> bool:
+        try:
+            fs = read_fault_sticks(path, self.g, time_shift_ms=shift_ms)
+        except Exception as exc:
+            self._error(f"Could not read {path}: {exc}"); return False
+        self.faults.append(FaultEntry(fs.name, str(Path(path).resolve()), float(shift_ms), fs.sticks))
+        self._mark_dirty()
+        return True
+
     def _clear_faults(self):
+        if self.faults:
+            self._mark_dirty()
         self.faults = []
         self._refresh_all()
 
@@ -506,22 +805,36 @@ class MainWindow(QMainWindow):
         shift, ok = QInputDialog.getDouble(self, "Time shift", "Time shift for the reference horizon (ms).\nF3 dGB files need +4 ms.", 0.0, -1000, 1000, 1)
         if not ok:
             return
-        self.reference = read_xyz_horizon(path, self.g, time_shift_ms=shift)
+        self.set_reference(path, shift)
+
+    def set_reference(self, path: str, shift_ms: float = 0.0) -> bool:
+        try:
+            self.reference = read_xyz_horizon(path, self.g, time_shift_ms=shift_ms)
+        except Exception as exc:
+            self._error(f"Could not read {path}: {exc}"); return False
+        self.reference_path, self.reference_shift = str(Path(path).resolve()), float(shift_ms)
         self.statusBar().showMessage(f"Reference horizon loaded: {Path(path).name}")
+        self._mark_dirty()
         self._refresh_all()
+        return True
 
-    def export_horizon(self):
-        if self.output is None:
+    def export_horizon(self, path: str | None = None):
+        if self.horizon_ms is None:
             QMessageBox.information(self, APP_NAME, "Extract a horizon first."); return
-        path, _ = QFileDialog.getSaveFileName(self, "Export horizon", self.settings.value("last_dir", "horizon.csv"), "CSV (*.csv)")
         if not path:
-            return
-        from ..export.horizon_export import export_horizon_csv
+            start = str(Path(self.settings.value("last_dir", "") or Path.home()) / "horizon.csv")
+            path, _ = QFileDialog.getSaveFileName(self, "Export horizon", start, "CSV (*.csv)")
+            if not path:
+                return
+        if self.output is not None:
+            from ..export.horizon_export import export_horizon_csv
 
-        o = self.output
-        export_horizon_csv(path, o.result, o.geometry, confidence=o.confidence.confidence, extra_flags={"off_phase": o.phase["off_phase_mask"]})
-        Path(path).with_suffix(".summary.json").write_text(json.dumps(o.summary, indent=2, default=float), encoding="utf-8")
-        self.statusBar().showMessage(f"Exported horizon to {path} (+ provenance and summary)")
+            o = self.output
+            export_horizon_csv(path, o.result, o.geometry, confidence=o.confidence.confidence, extra_flags={"off_phase": o.phase["off_phase_mask"]})
+        else:  # horizon reloaded from a project: full engine flags are not kept, export time + confidence
+            export_grid_csv(path, self.horizon_ms, self.g, self.conf_full)
+        Path(path).with_suffix(".summary.json").write_text(json.dumps(self.horizon_summary, indent=2, default=float), encoding="utf-8")
+        self.statusBar().showMessage(f"Exported horizon to {path} (+ summary)")
 
     def save_figures(self):
         d = QFileDialog.getExistingDirectory(self, "Save figures to folder", self.settings.value("last_dir", ""))
@@ -543,8 +856,9 @@ class MainWindow(QMainWindow):
         if self.vol is None or ev.inaxes is not self.sec_canvas.ax or ev.xdata is None:
             return
         if self.sec_canvas.toolbar_mode():
-            self.statusBar().showMessage("Pan tool is on: click the hand icon again (or press Reset zoom) to go back to picking.")
-            return
+            if "pan" in str(getattr(self.sec_toolbar, "mode", "")):
+                self.statusBar().showMessage("Pan tool is on: click the hand icon again (or press Reset zoom) to go back to picking.")
+            return  # zoom box drag in progress: the release handler switches the tool off
         g = self.g
         inline_view = self.direction.currentIndex() == 0
         line = self._current_line()
@@ -554,6 +868,7 @@ class MainWindow(QMainWindow):
             t = self._snap(il, xl, float(ev.ydata))
             p = SeedPick(il, xl, t, phase=self.snap.currentText() if self.snap.currentText() != "none" else "unspecified")
             self.picks.add(p); self.undo_stack.append(("add", p))
+            self._mark_dirty()
             self.statusBar().showMessage(f"Pick added: IL {il} XL {xl} {t:.1f} ms")
         elif ev.button == 3:
             on_line = [p for p in self.picks.picks if (p.inline == line if inline_view else p.crossline == line)]
@@ -563,6 +878,7 @@ class MainWindow(QMainWindow):
             k = int(np.argmin(d))
             if d[k] < 3:
                 p = on_line[k]; self.picks.picks.remove(p); self.undo_stack.append(("del", p))
+                self._mark_dirty()
                 self.statusBar().showMessage("Pick removed")
         self._refresh_picks(); self.draw_section(); self.draw_map()
 
@@ -627,12 +943,15 @@ class MainWindow(QMainWindow):
             self.picks.picks.remove(p)
         elif kind == "del":
             self.picks.add(p)
+        self._mark_dirty()
         self._refresh_picks(); self.draw_section(); self.draw_map()
 
     def _delete_selected(self):
         rows = sorted({i.row() for i in self.pick_table.selectedIndexes()}, reverse=True)
         for r in rows:
             p = self.picks.picks.pop(r); self.undo_stack.append(("del", p))
+        if rows:
+            self._mark_dirty()
         self._refresh_all()
 
     def _clear_picks(self):
@@ -640,6 +959,7 @@ class MainWindow(QMainWindow):
             for p in self.picks.picks:
                 self.undo_stack.append(("del", p))
             self.picks = PickSet()
+            self._mark_dirty()
             self._refresh_all()
 
     def _goto_pick(self, row, _col):
@@ -735,34 +1055,45 @@ class MainWindow(QMainWindow):
             return
         times = [p.time_ms for p in self.picks.approved()]
         roi = ROI(roi.inline_range, roi.crossline_range, (min(times) - self.margin.value(), max(times) + self.margin.value()))
-        self._start(_extract, (self.vol, self.picks, roi, list(self.faults)), self._extraction_done, "Extracting horizon...")
+        sticks = [f.to_fault_sticks() for f in self.faults]
+        self._start(_extract, (self.vol, PickSet(list(self.picks.picks)), roi, sticks), self._extraction_done, "Extracting horizon...")
 
     def _extraction_done(self, out):
         self.output = out
         shape = self.vol.live_mask.shape
         self.horizon_ms = out.full_grid(shape, "time_ms")
         self.conf_full = out.full_grid(shape, "confidence")
-        s = out.summary
-        lines = [
-            f"<b>Horizon extracted</b> ({'converged' if s['converged'] else 'NOT converged'} in {s['iterations']} iterations, "
-            f"{s['slopes_s'] + s['extract_s']:.0f} s)",
-            f"Area: IL {s['roi']['inlines'][0]}–{s['roi']['inlines'][1]}, XL {s['roi']['crosslines'][0]}–{s['roi']['crosslines'][1]}",
-            f"Picks used: {s['n_picks']} · fault cut-offs: {s['n_fault_cutoffs']}",
-            f"In phase with the picked event: {s['fraction_in_phase']:.0%}",
-            f"Mean confidence {s['confidence']['mean_confidence']:.2f}; {s['confidence']['fraction_reliable_ge_0.7']:.0%} of the area ≥ 0.7",
-        ]
-        if s["uninterpreted_live_cells"]:
-            lines.append(f"<span style='color:#c0392b'>{s['uninterpreted_live_cells']} traces left blank (fault block without a pick)</span>")
-        if self.reference is not None:
-            from ..quality_control.horizon_residuals import compare_to_reference
-            m = compare_to_reference(self.horizon_ms, self.g.time_ms(self.reference))
-            lines.append(f"Vs reference: mean diff {m.mae_ms:.2f} ms, {m.within_10ms:.0%} within ±10 ms")
-        for n in s["notes"]:
-            lines.append(f"<i>{n}</i>")
-        self.result_box.setHtml("<br>".join(lines))
+        i0, j0, _ = out.offsets
+        self.cuts_full = [np.asarray(c, float) + np.array([i0, j0]) for c in out.cuts]
+        self.horizon_summary = json.loads(json.dumps(out.summary, default=float))
+        self.result_box.setHtml(self._summary_html(self.horizon_summary))
+        self._mark_dirty()
         self.statusBar().showMessage("Horizon extracted. See the section, map and 3D tabs.")
         self._refresh_all()
         self.tabs.setCurrentIndex(2)
+
+    def _summary_html(self, s: dict, saved: bool = False) -> str:
+        if not s:
+            return "<b>Saved horizon</b> (no summary stored)" if saved else ""
+        lines = [
+            f"<b>{'Saved horizon' if saved else 'Horizon extracted'}</b> ({'converged' if s.get('converged') else 'NOT converged'} in "
+            f"{s.get('iterations', '?')} iterations, {s.get('slopes_s', 0) + s.get('extract_s', 0):.0f} s)",
+            f"Area: IL {s['roi']['inlines'][0]}–{s['roi']['inlines'][1]}, XL {s['roi']['crosslines'][0]}–{s['roi']['crosslines'][1]}",
+            f"Picks used: {s.get('n_picks')} · fault cut-offs: {s.get('n_fault_cutoffs')}",
+            f"In phase with the picked event: {s.get('fraction_in_phase', float('nan')):.0%}",
+            f"Mean confidence {s['confidence']['mean_confidence']:.2f}; {s['confidence']['fraction_reliable_ge_0.7']:.0%} of the area ≥ 0.7",
+        ]
+        if s.get("uninterpreted_live_cells"):
+            lines.append(f"<span style='color:#c0392b'>{s['uninterpreted_live_cells']} traces left blank (fault block without a pick)</span>")
+        if self.reference is not None and self.horizon_ms is not None:
+            from ..quality_control.horizon_residuals import compare_to_reference
+            m = compare_to_reference(self.horizon_ms, self.g.time_ms(self.reference))
+            lines.append(f"Vs reference: mean diff {m.mae_ms:.2f} ms, {m.within_10ms:.0%} within ±10 ms")
+        for n in s.get("notes", []):
+            lines.append(f"<i>{n}</i>")
+        if saved:
+            lines.append("<i>Reloaded from the project. Extract again to refresh it after editing picks.</i>")
+        return "<br>".join(lines)
 
     # ------------------------------------------------------------------ drawing
     def _refresh_picks(self):
@@ -864,10 +1195,8 @@ class MainWindow(QMainWindow):
         for f in self.faults:
             for s in f.sticks:
                 ax.plot(g.ilines[0] + s[:, 0] * g.il_step, g.xlines[0] + s[:, 1] * g.xl_step, "-", color="#e74c3c", lw=0.8)
-        if self.output is not None:
-            i0, j0, _ = self.output.offsets
-            for cut in self.output.cuts:
-                ax.plot(g.ilines[0] + (cut[:, 0] + i0) * g.il_step, g.xlines[0] + (cut[:, 1] + j0) * g.xl_step, "-", color="#e74c3c", lw=2)
+        for cut in self.cuts_full:
+            ax.plot(g.ilines[0] + cut[:, 0] * g.il_step, g.xlines[0] + cut[:, 1] * g.xl_step, "-", color="#e74c3c", lw=2)
         if self.vol is not None:
             inline_view = self.direction.currentIndex() == 0
             line = self._current_line()
@@ -930,9 +1259,13 @@ class MainWindow(QMainWindow):
             pl.add_text("Extract a horizon to see it in 3D", font_size=12)
             pl.render(); return
         g = self.g
-        o = self.output
-        i0, j0, _ = o.offsets
-        t = g.time_ms(o.result.t)
+        fin = np.isfinite(self.horizon_ms)
+        if not fin.any():
+            pl.add_text("The horizon is empty", font_size=12); pl.render(); return
+        ri, rj = np.nonzero(fin.any(axis=1))[0], np.nonzero(fin.any(axis=0))[0]
+        i0, i1, j0, j1 = ri[0], ri[-1] + 1, rj[0], rj[-1] + 1
+        t = self.horizon_ms[i0:i1, j0:j1]
+        conf = None if self.conf_full is None else self.conf_full[i0:i1, j0:j1]
         ni, nj = t.shape
         ii, jj = np.meshgrid(np.arange(i0, i0 + ni), np.arange(j0, j0 + nj), indexing="ij")
         if g.affine is not None:
@@ -942,17 +1275,18 @@ class MainWindow(QMainWindow):
         tv = np.where(np.isfinite(t), t, np.nanmean(t))
         z = -tv * self.ve.value()
         grid = pv.StructuredGrid(x.astype(float), y.astype(float), z.astype(float))
-        if self.color3d.currentText() == "time":
+        if self.color3d.currentText() == "time" or conf is None:
             grid["TWT (ms)"] = t.ravel(order="F")
             scal, cmap, clim = "TWT (ms)", "viridis_r", None
         else:
-            grid["confidence"] = o.confidence.confidence.ravel(order="F")
+            grid["confidence"] = conf.ravel(order="F")
             scal, cmap, clim = "confidence", "magma", (0, 1)
         bad = ~np.isfinite(t.ravel(order="F"))
         if bad.any():
             grid = grid.extract_points(~bad, adjacent_cells=False)
         pl.add_mesh(grid, scalars=scal, cmap=cmap, clim=clim, show_edges=False, nan_color="white", smooth_shading=True)
-        for cut in o.cuts:
+        for cut_full in self.cuts_full:
+            cut = cut_full - np.array([i0, j0])
             cx, cy = (g.world_xy(cut[:, 0] + i0, cut[:, 1] + j0) if g.affine is not None else ((cut[:, 0] + i0) * 25.0, (cut[:, 1] + j0) * 25.0))
             ci = np.clip(np.rint(cut[:, 0]).astype(int), 0, ni - 1); cj = np.clip(np.rint(cut[:, 1]).astype(int), 0, nj - 1)
             cz = -tv[ci, cj] * self.ve.value() + 5
@@ -963,6 +1297,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ help
     def show_help(self):
         QMessageBox.information(self, "How to use", (
+            "0. File > New project... names your work and picks the seismic. File > Save project (Ctrl+S) keeps picks, faults,\n"
+            "   reference, settings and the last horizon in one .shproj file; File > Open project... brings it all back.\n"
             "1. File > Open SEG-Y... (checked and converted once), or Open HDF5 volume...\n"
             "2. In 'Seismic section', move the slider to a line. Left-click on the target reflection to add a pick "
             "(it snaps to the nearest peak or trough). Right-click removes a pick; Ctrl+Z undoes.\n"
@@ -971,11 +1307,13 @@ class MainWindow(QMainWindow):
             "4. Press 'Extract horizon'. The area is chosen around your picks unless you set it yourself.\n"
             "5. Review the horizon on the sections, the 'Horizon map' (time, confidence, difference) and '3D view'.\n"
             "   Add or move picks where it is wrong and extract again.\n"
-            "6. File > Export horizon (CSV) to use it in Petrel, OpendTect or Excel. File > Save picks to keep your work."))
+            "6. File > Export horizon (CSV) to use it in Petrel, OpendTect or Excel. File > Save project to keep your work."))
 
     def closeEvent(self, ev):
         if self._thread is not None:
             QMessageBox.information(self, APP_NAME, "Please wait for the running task to finish.")
+            ev.ignore(); return
+        if not self._maybe_save():
             ev.ignore(); return
         if self.vol:
             self.vol.close()
@@ -992,6 +1330,23 @@ def _qc_markdown(qc: dict) -> str:
     if geo:
         lines += ["", "## Geometry", ""] + [f"- **{k}**: {v}" for k, v in geo.items()]
     return "\n".join(lines)
+
+
+def _safe_name(name: str) -> str:
+    """A file name from a project name (Windows-safe)."""
+    bad = '<>:"/\\|?*'
+    out = "".join("_" if c in bad or ord(c) < 32 else c for c in name).strip(" .")
+    return out or "project"
+
+
+def _h5_from_segy(h5: Path, segy: Path) -> bool:
+    """True if an HDF5 volume records a SEG-Y of this file name as its input (cheap check, no hashing)."""
+    try:
+        with SeismicVolume(h5) as v:
+            inputs = v.provenance.get("inputs", {})
+    except Exception:
+        return False
+    return segy.name in inputs
 
 
 def _toolbar_mode(self) -> bool:
@@ -1012,6 +1367,8 @@ def main(argv: list[str] | None = None) -> int:
     args = (sys.argv if argv is None else argv)[1:]
     if args and args[0].lower().endswith((".h5", ".hdf5")):
         w.open_h5(args[0])
+    elif args and args[0].lower().endswith(PROJECT_SUFFIX):
+        w.open_project(args[0])
     return app.exec()
 
 
